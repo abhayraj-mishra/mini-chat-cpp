@@ -1,0 +1,6 @@
+build/
+*.o
+mini_chat
+bench_chat_*.txt
+__pycache__/
+*.pyc

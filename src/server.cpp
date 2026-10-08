@@ -1,7 +1,8 @@
 #include "server.hpp"
 #include <iostream>
-#include <sstream>
 #include <cstring>
+#include <cerrno>
+#include <csignal>
 #include <unistd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -17,12 +18,18 @@ void setNonBlocking(int fd) {
 
 ChatServer::ChatServer(int port) : port_(port) {}
 
+void ChatServer::updateEpoll(int fd, uint32_t events) {
+    epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epollFd_, EPOLL_CTL_MOD, fd, &ev);
+}
+
 void ChatServer::run() {
+    signal(SIGPIPE, SIG_IGN);   // writes to closed sockets return EPIPE instead of killing us
+
     listenFd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenFd_ < 0) {
-        std::cerr << "Failed to create socket\n";
-        return;
-    }
+    if (listenFd_ < 0) { std::cerr << "socket() failed\n"; return; }
 
     int opt = 1;
     setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -33,11 +40,11 @@ void ChatServer::run() {
     addr.sin_port = htons(port_);
 
     if (bind(listenFd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Bind failed on port " << port_ << "\n";
-        return;
+        std::cerr << "bind failed on port " << port_ << "\n"; return;
     }
-
-    listen(listenFd_, 128);
+    if (listen(listenFd_, 512) < 0) {
+        std::cerr << "listen failed\n"; return;
+    }
     setNonBlocking(listenFd_);
 
     epollFd_ = epoll_create1(0);
@@ -46,21 +53,24 @@ void ChatServer::run() {
     ev.data.fd = listenFd_;
     epoll_ctl(epollFd_, EPOLL_CTL_ADD, listenFd_, &ev);
 
-    std::cout << "mini-chat listening on port " << port_ << "...\n";
+    std::cout << "mini-chat listening on port " << port_ << std::endl;
 
-    const int MAX_EVENTS = 64;
+    const int MAX_EVENTS = 256;
     epoll_event events[MAX_EVENTS];
 
     while (true) {
         int n = epoll_wait(epollFd_, events, MAX_EVENTS, -1);
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
+            uint32_t evs = events[i].events;
+
             if (fd == listenFd_) {
                 acceptNewConnection();
-            } else if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+            } else if (evs & (EPOLLHUP | EPOLLERR)) {
                 disconnectClient(fd);
-            } else if (events[i].events & EPOLLIN) {
-                handleClientData(fd);
+            } else {
+                if (evs & EPOLLOUT) handleClientWrite(fd);
+                if (clients_.count(fd) && (evs & EPOLLIN)) handleClientRead(fd);
             }
         }
     }
@@ -82,77 +92,149 @@ void ChatServer::acceptNewConnection() {
     Client c;
     c.fd = clientFd;
     c.nickname = "guest" + std::to_string(clientFd);
-    clients_[clientFd] = c;
+    clients_[clientFd] = std::move(c);
+    rooms_[clients_[clientFd].room].insert(clientFd);
 
-    std::string welcome = "Welcome! You are " + c.nickname + " in #lobby. Use /nick <name> and /join <room>.\n";
-    write(clientFd, welcome.c_str(), welcome.size());
+    std::string welcome = "Welcome! You are " + clients_[clientFd].nickname
+                        + " in #lobby. Use /nick <name> and /join <room>.\n";
+    clients_[clientFd].outbuf += welcome;
+    tryFlush(clientFd);
 }
 
 void ChatServer::disconnectClient(int fd) {
-    epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
-    close(fd);
     auto it = clients_.find(fd);
     if (it != clients_.end()) {
-        broadcastToRoom(it->second.room, it->second.nickname + " left the chat.\n", fd);
+        std::string room = it->second.room;
+        std::string nick = it->second.nickname;
+
+        auto rit = rooms_.find(room);
+        if (rit != rooms_.end()) {
+            rit->second.erase(fd);
+            if (rit->second.empty()) rooms_.erase(rit);
+        }
+
         clients_.erase(it);
+        broadcastToRoom(room, nick + " left the chat.\n", fd);
     }
+    epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr);
+    close(fd);
 }
 
-void ChatServer::handleClientData(int fd) {
-    char buffer[4096];
-    ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
-    if (bytesRead <= 0) {
+void ChatServer::handleClientRead(int fd) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end()) return;
+
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n == 0) { disconnectClient(fd); return; }
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
         disconnectClient(fd);
         return;
     }
-    buffer[bytesRead] = '\0';
+    it->second.inbuf.append(buf, static_cast<size_t>(n));
 
-    std::istringstream stream(buffer);
-    std::string line;
-    while (std::getline(stream, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
+    while (true) {
+        auto cit = clients_.find(fd);
+        if (cit == clients_.end()) return;
+
+        size_t pos = cit->second.inbuf.find('\n');
+        if (pos == std::string::npos) break;
+
+        std::string line = cit->second.inbuf.substr(0, pos);
+        cit->second.inbuf.erase(0, pos + 1);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-        processLine(clients_[fd], line);
+
+        processLine(cit->second, line);
+    }
+}
+
+void ChatServer::handleClientWrite(int fd) {
+    tryFlush(fd);
+}
+
+void ChatServer::tryFlush(int fd) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end()) return;
+    Client& c = it->second;
+
+    while (!c.outbuf.empty()) {
+        ssize_t n = write(fd, c.outbuf.data(), c.outbuf.size());
+        if (n > 0) {
+            c.outbuf.erase(0, static_cast<size_t>(n));
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!c.wantWrite) {
+                c.wantWrite = true;
+                updateEpoll(fd, EPOLLIN | EPOLLOUT);
+            }
+            return;
+        } else {
+            return;
+        }
+    }
+    if (c.wantWrite) {
+        c.wantWrite = false;
+        updateEpoll(fd, EPOLLIN);
     }
 }
 
 void ChatServer::processLine(Client& client, const std::string& line) {
     if (line.rfind("/nick ", 0) == 0) {
         client.nickname = line.substr(6);
-        std::string msg = "You are now known as " + client.nickname + "\n";
-        write(client.fd, msg.c_str(), msg.size());
+        client.outbuf += "You are now known as " + client.nickname + "\n";
+        tryFlush(client.fd);
         return;
     }
 
     if (line.rfind("/join ", 0) == 0) {
         std::string newRoom = line.substr(6);
-        broadcastToRoom(client.room, client.nickname + " left the room.\n", client.fd);
+        std::string oldRoom = client.room;
+
+        auto oldIt = rooms_.find(oldRoom);
+        if (oldIt != rooms_.end()) {
+            oldIt->second.erase(client.fd);
+            if (oldIt->second.empty()) rooms_.erase(oldIt);
+        }
+        broadcastToRoom(oldRoom, client.nickname + " left the room.\n", client.fd);
+
         client.room = newRoom;
+        rooms_[newRoom].insert(client.fd);
         broadcastToRoom(client.room, client.nickname + " joined the room.\n", client.fd);
-        std::string msg = "Joined #" + newRoom + "\n";
-        write(client.fd, msg.c_str(), msg.size());
+
+        client.outbuf += "Joined #" + newRoom + "\n";
+        tryFlush(client.fd);
         return;
     }
 
     if (line == "/list") {
         std::string msg = "Users in #" + client.room + ":\n";
-        for (auto& [fd, c] : clients_) {
-            if (c.room == client.room) msg += "  " + c.nickname + "\n";
+        auto it = rooms_.find(client.room);
+        if (it != rooms_.end()) {
+            for (int fd : it->second) {
+                auto cit = clients_.find(fd);
+                if (cit != clients_.end()) msg += "  " + cit->second.nickname + "\n";
+            }
         }
-        write(client.fd, msg.c_str(), msg.size());
+        client.outbuf += msg;
+        tryFlush(client.fd);
         return;
     }
 
-    // default: broadcast as a chat message
     std::string out = "[" + client.room + "] " + client.nickname + ": " + line + "\n";
-    broadcastToRoom(client.room, out, -1); // include sender, so they see their own message too
+    broadcastToRoom(client.room, out, -1);
 }
 
 void ChatServer::broadcastToRoom(const std::string& room, const std::string& message, int excludeFd) {
-    for (auto& [fd, c] : clients_) {
-        if (c.room == room && fd != excludeFd) {
-            write(fd, message.c_str(), message.size());
-        }
+    auto it = rooms_.find(room);
+    if (it == rooms_.end()) return;
+
+    std::vector<int> targets(it->second.begin(), it->second.end());
+    for (int fd : targets) {
+        if (fd == excludeFd) continue;
+        auto cit = clients_.find(fd);
+        if (cit == clients_.end()) continue;
+        cit->second.outbuf += message;
+        tryFlush(fd);
     }
 }
