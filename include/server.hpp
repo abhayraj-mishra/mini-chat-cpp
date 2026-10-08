@@ -1,27 +1,17 @@
 #pragma once
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <cstdint>
 
-// A single-threaded, event-driven (epoll-based) multi-room chat server.
-// Deliberately built differently from a thread-per-client model to show
-// understanding of I/O multiplexing -- a common systems interview topic.
-//
-// Client commands (one per line):
-//   /nick <name>          set your display name
-//   /join <room>          join or switch to a room (default room: "lobby")
-//   /list                 list users in your current room
-//   anything else         broadcast the line to everyone in your room
-//
-// TODO(day2): add a message-rate limiter per client to prevent flooding.
-// TODO(day3): persist chat history per room to disk, replay last N lines
-//             to a client when they /join a room.
-// TODO(day4): add private messaging: /msg <user> <text>.
-// TODO(day5): add basic auth (token in first line) before allowing /nick.
 struct Client {
-    int fd;
+    int fd = -1;
     std::string nickname;
     std::string room = "lobby";
+    std::string inbuf;    // accumulates until '\n'
+    std::string outbuf;   // pending bytes to send
+    bool wantWrite = false;
 };
 
 class ChatServer {
@@ -31,13 +21,17 @@ public:
 
 private:
     void acceptNewConnection();
-    void handleClientData(int fd);
+    void handleClientRead(int fd);
+    void handleClientWrite(int fd);
     void disconnectClient(int fd);
     void broadcastToRoom(const std::string& room, const std::string& message, int excludeFd = -1);
     void processLine(Client& client, const std::string& line);
+    void tryFlush(int fd);
+    void updateEpoll(int fd, uint32_t events);
 
     int port_;
     int listenFd_ = -1;
     int epollFd_ = -1;
-    std::unordered_map<int, Client> clients_; // fd -> client state
+    std::unordered_map<int, Client> clients_;
+    std::unordered_map<std::string, std::unordered_set<int>> rooms_;
 };
